@@ -300,9 +300,9 @@ static bool audioOpen(AudioOut& ao, int srcRate, double rateF) {
     if (err < 0) { ao.pcm = NULL; return false; }
     ao.outRate = (unsigned int)((double)srcRate * rateF + 0.5);
     if (ao.outRate < 8000) ao.outRate = (unsigned int)srcRate;
-    // S16_LE, 交错, 2ch, 软重采样允许, 200ms 缓冲
+    // S16_LE, 交错, 2ch, 软重采样允许, 500ms 缓冲（大缓冲减少视频 blit 阻塞导致的 underrun 爆音）
     err = g_libs.snd_pcm_set_params_(ao.pcm, 2 /*S16_LE*/, 3 /*RW_INTERLEAVED*/,
-                                     2, ao.outRate, 1, 200000);
+                                     2, ao.outRate, 1, 500000);
     if (err < 0) { audioClose(ao); return false; }
     ao.ok = true;
     return true;
@@ -710,9 +710,11 @@ static void* decodeThread(void* arg) {
                                             failStreak = 0;
                                         } else if (wrote == -11 /*EAGAIN*/) {
                                             usleep(4000);
-                                        } else if (++failStreak <= 10 && g_libs.snd_pcm_prepare_ &&
-                                                   g_libs.snd_pcm_prepare_(ao.pcm) == 0) {
-                                            continue;
+                                        } else if (++failStreak <= 10) {
+                                            /* xrun: drop stale buffer then prepare to restart clean */
+                                            if (g_libs.snd_pcm_drop_) g_libs.snd_pcm_drop_(ao.pcm);
+                                            if (g_libs.snd_pcm_prepare_ && g_libs.snd_pcm_prepare_(ao.pcm) == 0) continue;
+                                            ao.ok = false; break;
                                         } else {
                                             ao.ok = false;  // 放弃音频，转墙钟
                                             break;
@@ -790,6 +792,11 @@ static void sessionStopAndFree(Session* s) {
     if (s->threadStarted) {
         pthread_join(s->thread, NULL);
         s->threadStarted = false;
+    }
+    /* Clear video frame from fb0 so it does not linger after app exit */
+    if (s->fb.valid && s->targetW > 0 && s->targetH > 0) {
+        uint8_t* black = (uint8_t*)calloc((size_t)s->targetW * (size_t)s->targetH * 4, 1);
+        if (black) { s->fb.blitLandscape(black, s->targetW, s->blitX, s->blitY, s->targetW, s->targetH); free(black); }
     }
     s->fb.close();
     delete s;
