@@ -1,8 +1,8 @@
-// 更好的视频播放器 · 原生 video 模块
+// 更好的视频播放器 · 原生 video 模块 (v3: 独立音频线程 + 固定采样率)
 // FFmpeg(4.4, libavcodec 58) 解码 + libswscale 缩放 + /dev/fb0 直写（竖屏 270° 旋转）+ ALSA 出声。
-// 所有第三方库运行时 dlopen（头文件 vendored 于 native/jsapi/ffmpeg-include，无链接期依赖）；
-// 目标固件缺库时 play 返回明确错误，应用可优雅降级。
-// 音视频事实来源：真机探测 profile（profiles/youdao-dictpen-coco1826.md）。
+// v3 修复：独立音频播放线程+环形缓冲（消除视频 blit 阻塞导致的 underrun）；
+//         固定 48000Hz ALSA 输出（倍速只改 swr 输入率，不 close/reopen ALSA）；
+//         stop 时清全屏 fb0 并等待 vsync（消除退出后画面残留）。
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "VideoBridge.hpp"
@@ -184,7 +184,7 @@ bool loadLibsOnce(Libs& L) {
         L.snd_pcm_prepare_ = reinterpret_cast<pfn_snd_pcm_prepare>(dlsym(L.alsa, "snd_pcm_prepare"));
         L.snd_pcm_drop_ = reinterpret_cast<pfn_snd_pcm_drop>(dlsym(L.alsa, "snd_pcm_drop"));
         L.snd_strerror_ = reinterpret_cast<pfn_snd_strerror>(dlsym(L.alsa, "snd_strerror"));
-        if (!alsaOk) { L.alsa = NULL; L.error.clear(); }  // ALSA 缺失按无声视频处理
+        if (!alsaOk) { L.alsa = NULL; L.error.clear(); }
     }
 
     L.ok = true;
@@ -199,11 +199,11 @@ struct FbWriter {
     int fd;
     uint8_t* mem;
     size_t memSize;
-    int stridePx;    // 一行像素数（含 padding，真机 256）
-    int physW;       // 可见物理宽（真机 254）
-    int physH;       // 可见物理高（真机 800）
-    int virtH;       // 虚拟高（双缓冲 = 2*physH）
-    int landscapeW;  // 逻辑宽（真机 800）
+    int stridePx;
+    int physW;
+    int physH;
+    int virtH;
+    int landscapeW;
     bool valid;
     std::string error;
 
@@ -238,17 +238,21 @@ struct FbWriter {
         valid = false;
     }
 
-    uint32_t* visibleBase() {
+    // 清全屏（所有缓冲）并等待 vsync，确保黑屏真正显示
+    void clearAll() {
+        if (!valid || !mem || memSize == 0) return;
+        memset(mem, 0, memSize);
+        // 设置显示偏移到第一缓冲
         fb_var_screeninfo vinfo;
-        int yoff = 0;
-        if (fd >= 0 && ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0) yoff = (int)vinfo.yoffset;
-        return (uint32_t*)(mem + (size_t)yoff * (size_t)stridePx * 4);
+        if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+            vinfo.yoffset = 0;
+            ioctl(fd, FBIOPUT_VSCREENINFO, &vinfo);
+        }
+        // 等待一帧 vsync 让硬件刷出黑屏
+        int dummy = 0;
+        ioctl(fd, FBIO_WAITFORVSYNC, &dummy);
     }
 
-    // 逻辑横屏 BGRA 缓冲 (w x h) 写到逻辑矩形 (lx, ly, w, h)。
-    // direction=270 映射：物理列 = ly + j，物理行 = (landscapeW-1) - (lx + i)。
-    // 运行时是双缓冲（yres_virtual = 2 * yres）并按 yoffset 平移，因此两个 buffer 都写，
-    // 保证运行时切缓冲后画面仍在。
     void blitLandscape(const uint8_t* src, int srcStridePx, int lx, int ly, int w, int h) {
         if (!valid || w <= 0 || h <= 0 || !src) return;
         const int flip = landscapeW;
@@ -270,52 +274,151 @@ struct FbWriter {
 };
 
 // ---------------------------------------------------------------------------
-// 播放会话
+// 音频播放：固定 48000Hz + 环形缓冲 + 独立播放线程
 // ---------------------------------------------------------------------------
+
+#define AUDIO_OUT_RATE 48000u
+#define AUDIO_RING_SECONDS 2
+#define AUDIO_RING_FRAMES (AUDIO_OUT_RATE * AUDIO_RING_SECONDS)
 
 static Libs g_libs;
 
-struct AudioOut {
+struct AudioPlayer {
     void* pcm;
-    unsigned int outRate;
     bool ok;
 
-    AudioOut() : pcm(NULL), outRate(48000), ok(false) {}
-};
+    int16_t* ring;
+    int ringCap;
+    int ringR, ringW;
+    int ringCount;
+    pthread_mutex_t mtx;
+    pthread_cond_t notFull;
+    pthread_cond_t notEmpty;
+    volatile bool quit;
+    volatile bool paused;
+    pthread_t thread;
+    bool threadStarted;
 
-static void audioClose(AudioOut& ao) {
-    if (ao.pcm && g_libs.snd_pcm_close_) {
-        if (g_libs.snd_pcm_drop_) g_libs.snd_pcm_drop_(ao.pcm);
-        g_libs.snd_pcm_close_(ao.pcm);
+    AudioPlayer() : pcm(NULL), ok(false), ring(NULL), ringCap(0),
+                    ringR(0), ringW(0), ringCount(0), quit(false), paused(false),
+                    thread(0), threadStarted(false) {
+        pthread_mutex_init(&mtx, NULL);
+        pthread_cond_init(&notFull, NULL);
+        pthread_cond_init(&notEmpty, NULL);
     }
-    ao.pcm = NULL;
-    ao.ok = false;
-}
 
-static bool audioOpen(AudioOut& ao, int srcRate, double rateF) {
-    ao.pcm = NULL;
-    ao.ok = false;
-    if (!g_libs.snd_pcm_open_) return false;
-    int err = g_libs.snd_pcm_open_(&ao.pcm, "default", 0 /*playback*/, 0 /*block*/);
-    if (err < 0) { ao.pcm = NULL; return false; }
-    ao.outRate = (unsigned int)((double)srcRate * rateF + 0.5);
-    if (ao.outRate < 8000) ao.outRate = (unsigned int)srcRate;
-    // S16_LE, 交错, 2ch, 软重采样允许, 500ms 缓冲（大缓冲减少视频 blit 阻塞导致的 underrun 爆音）
-    err = g_libs.snd_pcm_set_params_(ao.pcm, 2 /*S16_LE*/, 3 /*RW_INTERLEAVED*/,
-                                     2, ao.outRate, 1, 500000);
-    if (err < 0) { audioClose(ao); return false; }
-    // 预填 150ms 静音，让缓冲一开始就有深度，避免 blit 阻塞导致 underrun 爆音
-    if (g_libs.snd_pcm_writei_) {
-        int prefill = (int)(ao.outRate * 0.15);
-        int16_t* silence = (int16_t*)calloc((size_t)prefill * 2, sizeof(int16_t));
-        if (silence) {
-            g_libs.snd_pcm_writei_(ao.pcm, silence, (unsigned long)prefill);
-            free(silence);
+    ~AudioPlayer() { stop(); }
+
+    bool start() {
+        if (ok) return true;
+        if (!g_libs.snd_pcm_open_) return false;
+        int err = g_libs.snd_pcm_open_(&pcm, "default", 0, 0);
+        if (err < 0) { pcm = NULL; return false; }
+        // 固定 48000Hz，1000ms ALSA 缓冲
+        err = g_libs.snd_pcm_set_params_(pcm, 2, 3, 2, AUDIO_OUT_RATE, 1, 1000000);
+        if (err < 0) { g_libs.snd_pcm_close_(pcm); pcm = NULL; return false; }
+
+        ringCap = AUDIO_RING_FRAMES;
+        ring = (int16_t*)calloc((size_t)ringCap * 2, sizeof(int16_t));
+        ringR = ringW = ringCount = 0;
+        quit = false;
+        paused = false;
+
+        if (pthread_create(&thread, NULL, playbackThread, this) != 0) {
+            free(ring); ring = NULL;
+            g_libs.snd_pcm_close_(pcm); pcm = NULL;
+            return false;
         }
+        threadStarted = true;
+        ok = true;
+        return true;
     }
-    ao.ok = true;
-    return true;
-}
+
+    void push(const int16_t* src, int frames) {
+        if (!ok || !ring || frames <= 0) return;
+        pthread_mutex_lock(&mtx);
+        while (frames > 0 && !quit) {
+            int space = ringCap - ringCount;
+            if (space == 0) { pthread_cond_wait(&notFull, &mtx); continue; }
+            int chunk = frames < space ? frames : space;
+            for (int i = 0; i < chunk; i++) {
+                int idx = (ringW + i) % ringCap;
+                ring[idx * 2]     = src[i * 2];
+                ring[idx * 2 + 1] = src[i * 2 + 1];
+            }
+            ringW = (ringW + chunk) % ringCap;
+            ringCount += chunk;
+            frames -= chunk;
+            pthread_cond_signal(&notEmpty);
+        }
+        pthread_mutex_unlock(&mtx);
+    }
+
+    void stop() {
+        if (threadStarted) {
+            pthread_mutex_lock(&mtx);
+            quit = true;
+            pthread_cond_broadcast(&notEmpty);
+            pthread_cond_broadcast(&notFull);
+            pthread_mutex_unlock(&mtx);
+            pthread_join(thread, NULL);
+            threadStarted = false;
+        }
+        if (ring) { free(ring); ring = NULL; }
+        if (pcm && g_libs.snd_pcm_close_) {
+            if (g_libs.snd_pcm_drop_) g_libs.snd_pcm_drop_(pcm);
+            g_libs.snd_pcm_close_(pcm);
+        }
+        pcm = NULL;
+        ok = false;
+    }
+
+    void clearBuffer() {
+        pthread_mutex_lock(&mtx);
+        ringR = ringW = ringCount = 0;
+        pthread_cond_broadcast(&notFull);
+        pthread_mutex_unlock(&mtx);
+    }
+
+    void setPaused(bool p) {
+        pthread_mutex_lock(&mtx);
+        paused = p;
+        pthread_cond_broadcast(&notEmpty);
+        pthread_mutex_unlock(&mtx);
+    }
+
+private:
+    static void* playbackThread(void* arg) {
+        AudioPlayer* self = (AudioPlayer*)arg;
+        int16_t tmp[1024 * 2];
+        while (!self->quit) {
+            pthread_mutex_lock(&self->mtx);
+            while (self->ringCount == 0 && !self->quit && !self->paused) {
+                pthread_cond_wait(&self->notEmpty, &self->mtx);
+            }
+            if (self->quit) { pthread_mutex_unlock(&self->mtx); break; }
+            if (self->paused) { pthread_mutex_unlock(&self->mtx); usleep(10000); continue; }
+            int chunk = self->ringCount < 1024 ? self->ringCount : 1024;
+            for (int i = 0; i < chunk; i++) {
+                int idx = (self->ringR + i) % self->ringCap;
+                tmp[i * 2]     = self->ring[idx * 2];
+                tmp[i * 2 + 1] = self->ring[idx * 2 + 1];
+            }
+            self->ringR = (self->ringR + chunk) % self->ringCap;
+            self->ringCount -= chunk;
+            pthread_cond_signal(&self->notFull);
+            pthread_mutex_unlock(&self->mtx);
+            if (self->pcm && g_libs.snd_pcm_writei_) {
+                long wrote = g_libs.snd_pcm_writei_(self->pcm, tmp, (unsigned long)chunk);
+                if (wrote < 0) {
+                    if (g_libs.snd_pcm_drop_) g_libs.snd_pcm_drop_(self->pcm);
+                    if (g_libs.snd_pcm_prepare_) g_libs.snd_pcm_prepare_(self->pcm);
+                }
+            }
+        }
+        return NULL;
+    }
+};
 
 static void applyVolume(int16_t* samples, int frames, int volume) {
     if (volume >= 100) return;
@@ -334,8 +437,8 @@ struct Session {
     volatile bool paused;
     volatile bool eos;
     volatile bool stopFlag;
-    volatile int ratePermillage;  // 1000 = 1.0x
-    volatile int volume;          // 0..100
+    volatile int ratePermillage;
+    volatile int volume;
     std::string mediaPath;
     std::string lastError;
 
@@ -344,8 +447,8 @@ struct Session {
     int64_t durationMs;
 
     FbWriter fb;
-    int rectLX, rectLY, rectW, rectH;   // JS 指定的视频区域（逻辑横屏坐标）
-    int blitX, blitY;                   // 实际 blit 原点（区域内居中后）
+    int rectLX, rectLY, rectW, rectH;
+    int blitX, blitY;
 
     pthread_t thread;
     bool threadStarted;
@@ -353,10 +456,10 @@ struct Session {
     pthread_mutex_t mutex;
     volatile bool seekPending;
     volatile int64_t seekTargetMs;
-    volatile bool viewDirty;   // setView 后需要重算缩放与 blit 区域
+    volatile bool viewDirty;
 
-    double basePosMs;      // 时钟基准（seek 目标 / 0）
-    double contentPosMs;   // 内容时间（UI 进度，倍速后）
+    double basePosMs;
+    double contentPosMs;
     double wallBaseMs;
     bool clockByAudio;
 
@@ -391,18 +494,17 @@ struct DecodeCtx {
     AVFrame* frame;
     AVPacket* pkt;
     SwsContext* sws;
-    int swsSrcFormat;  // sws 按该输入像素格式建立
+    int swsSrcFormat;
     int swsSrcW;
     SwrContext* swr;
-    int swrInFormat;      // swr 按该输入格式建立
+    int swrInFormat;
     int swrInRate;
     uint64_t swrInLayout;
-    int swrOutRate;
     AVRational vTimeBase;
 
     DecodeCtx() : fmt(NULL), vctx(NULL), actx(NULL), vStream(-1), aStream(-1),
                   frame(NULL), pkt(NULL), sws(NULL), swsSrcFormat(-1), swsSrcW(0), swr(NULL),
-                  swrInFormat(-1), swrInRate(0), swrInLayout(0), swrOutRate(0) {
+                  swrInFormat(-1), swrInRate(0), swrInLayout(0) {
         vTimeBase.num = 0; vTimeBase.den = 0;
     }
 };
@@ -417,12 +519,11 @@ static void decodeCtxClose(DecodeCtx& d) {
     if (d.fmt) g_libs.avformat_close_input_(&d.fmt);
 }
 
-// swr 重建（输入格式/率/声道布局或倍速变化时）
+// swr 重建：固定输出 48000Hz，输入率 = 源率 * 倍速（实现变速不变 ALSA）
 static bool ensureSwr(DecodeCtx& d, AVFrame* frame, int ratePermillage) {
-    const int wantRate = (int)((double)frame->sample_rate * ((double)ratePermillage / 1000.0) + 0.5);
-    if (d.swr && d.swrInFormat == frame->format && d.swrInRate == frame->sample_rate &&
-        d.swrInLayout == (frame->channel_layout ? frame->channel_layout : 3) &&
-        d.swrOutRate == wantRate) {
+    const int inRateForSpeed = (int)((double)frame->sample_rate * ((double)ratePermillage / 1000.0) + 0.5);
+    if (d.swr && d.swrInFormat == frame->format && d.swrInRate == inRateForSpeed &&
+        d.swrInLayout == (frame->channel_layout ? frame->channel_layout : 3)) {
         return true;
     }
     if (d.swr) {
@@ -430,36 +531,31 @@ static bool ensureSwr(DecodeCtx& d, AVFrame* frame, int ratePermillage) {
         d.swr = NULL;
     }
     uint64_t inLayout = frame->channel_layout;
-    if (inLayout == 0) inLayout = frame->channels == 1 ? 1 : 3;  // MONO / STEREO
-    const int outRate = (int)((double)frame->sample_rate * ((double)ratePermillage / 1000.0) + 0.5);
+    if (inLayout == 0) inLayout = frame->channels == 1 ? 1 : 3;
+    // 输出固定 48000Hz；输入率 = 源率 * 倍速（倍速时输入率变高，swr 压缩时间 = 变速）
     d.swr = g_libs.swr_alloc_set_opts_(NULL,
-                                       3 /*stereo*/, (AVSampleFormat)AV_SAMPLE_FMT_S16, outRate,
-                                       (int64_t)inLayout, (AVSampleFormat)frame->format, frame->sample_rate,
+                                       3, (AVSampleFormat)AV_SAMPLE_FMT_S16, (int)AUDIO_OUT_RATE,
+                                       (int64_t)inLayout, (AVSampleFormat)frame->format, inRateForSpeed,
                                        0, NULL);
     if (!d.swr) return false;
     if (g_libs.swr_init_(d.swr) < 0) { g_libs.swr_free_(&d.swr); d.swr = NULL; return false; }
     d.swrInFormat = frame->format;
-    d.swrInRate = frame->sample_rate;
+    d.swrInRate = inRateForSpeed;
     d.swrInLayout = inLayout;
-    d.swrOutRate = outRate;
     return true;
 }
 
 static void* decodeThread(void* arg) {
     Session& s = *reinterpret_cast<Session*>(arg);
     DecodeCtx d;
-    AudioOut ao;
+    AudioPlayer audio;
     uint8_t* scaleBuf = NULL;
     int scaleBufSize = 0;
     int16_t* outSamples = NULL;
     size_t outSamplesBytes = 0;
-    bool opened = false;
-    int capMaxW = 0;   // JS 画质上限（首帧探测后设置）
+    int capMaxW = 0;
     int capMaxH = 0;
 
-    // 目标尺寸（降画质）与 blit 原点：可重复计算（setView 切换视频区域时重算）
-    //   可用区域 = JS 传入的视频矩形 rectW×rectH（逻辑横屏坐标），缺省全屏 800×254
-    //   取「原始尺寸、画质上限、可用区域」三者最小并等比缩放，不放大，区域内居中。
     auto recomputeTarget = [&]() {
         const int availW = (s.rectW > 0 && s.rectW <= 800) ? s.rectW : 800;
         const int availH = (s.rectH > 0 && s.rectH <= 254) ? s.rectH : 254;
@@ -479,7 +575,6 @@ static void* decodeThread(void* arg) {
         s.blitY = s.rectLY + (availH - s.targetH) / 2;
     };
 
-    // ---- 打开 ----
     if (g_libs.avformat_open_input_(&d.fmt, s.mediaPath.c_str(), NULL, NULL) != 0) {
         s.lastError = "open-failed";
         goto done;
@@ -541,39 +636,35 @@ static void* decodeThread(void* arg) {
         if (!scaleBuf) { s.lastError = "alloc-failed"; goto done; }
     }
     if (d.aStream >= 0) {
-        outSamplesBytes = (size_t)(192000 * 2 * 2);  // 1s@48k 立体声 s16 上限
+        outSamplesBytes = (size_t)(96000 * 2 * 2);
         outSamples = (int16_t*)malloc(outSamplesBytes);
-        // 不在此处预打开 ALSA：等第一帧音频拿到真实采样率再开，
-        // 避免 close+reopen 产生的启动咔哒声。
     }
 
     s.clockByAudio = false;
     s.basePosMs = 0;
     s.wallBaseMs = s.nowMs();
     s.contentPosMs = 0;
-    opened = true;
 
-    // ---- 主循环 ----
     {
         bool videoEof = false, audioEof = false;
         bool hasPendingVideo = false;
         double pendingPtsMs = -1;
         bool sentVFlush = false, sentAFlush = false;
-        int64_t playedSrcSamples = 0;   // 已送入 swr 的源采样数（进度推算用）
-        bool frameReady = false;        // 缩放缓冲里已有可重绘的帧
+        int64_t playedSrcSamples = 0;
+        bool frameReady = false;
         double lastBlitMs = 0;
 
         while (!s.stopFlag) {
-            // seek
             if (s.seekPending) {
                 pthread_mutex_lock(&s.mutex);
                 const int64_t target = s.seekTargetMs;
                 s.seekPending = false;
                 pthread_mutex_unlock(&s.mutex);
-                const int64_t ts = target * 1000;  // ms -> AV_TIME_BASE(us)
+                const int64_t ts = target * 1000;
                 if (d.fmt) g_libs.av_seek_frame_(d.fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
                 if (d.vctx) g_libs.avcodec_flush_buffers_(d.vctx);
                 if (d.actx) g_libs.avcodec_flush_buffers_(d.actx);
+                audio.clearBuffer();
                 hasPendingVideo = false;
                 videoEof = audioEof = false;
                 sentVFlush = sentAFlush = false;
@@ -598,18 +689,20 @@ static void* decodeThread(void* arg) {
             }
 
             if (s.paused) {
+                audio.setPaused(true);
                 if (frameReady && s.fb.valid && s.targetW > 0 && s.nowMs() - lastBlitMs > 400) {
                     s.fb.blitLandscape(scaleBuf, s.targetW, s.blitX, s.blitY, s.targetW, s.targetH);
                     lastBlitMs = s.nowMs();
                 }
-                s.wallBaseMs = s.nowMs();  // 冻结墙钟
+                s.wallBaseMs = s.nowMs();
                 usleep(20000);
                 continue;
+            } else {
+                audio.setPaused(false);
             }
 
             bool fedPacket = false;
 
-            // 喂一个包
             if ((!videoEof || !audioEof) && !s.seekPending) {
                 int ret = g_libs.av_read_frame_(d.fmt, d.pkt);
                 if (ret == 0) {
@@ -630,7 +723,7 @@ static void* decodeThread(void* arg) {
                 }
             }
 
-            // 收视频帧（只保留最新的可呈现帧，旧帧丢弃 = 追帧）
+            // 收视频帧
             if (d.vctx) {
                 while (true) {
                     int ret = g_libs.avcodec_receive_frame_(d.vctx, d.frame);
@@ -640,7 +733,6 @@ static void* decodeThread(void* arg) {
                             ptsMs = (double)d.frame->pts * 1000.0 * (double)d.vTimeBase.num / (double)d.vTimeBase.den;
                         }
                         if (scaleBuf && s.targetW > 0 && s.targetH > 0) {
-                            // 源格式首帧才确定：sws 未建或格式变化时（重）建
                             if (!d.sws || d.swsSrcFormat != d.frame->format || d.swsSrcW != s.videoW) {
                                 if (d.sws) g_libs.sws_freeContext_(d.sws);
                                 d.sws = g_libs.sws_getContext_(s.videoW, s.videoH, (AVPixelFormat)d.frame->format,
@@ -658,7 +750,6 @@ static void* decodeThread(void* arg) {
                                             pendingPtsMs = ptsMs;
                                             hasPendingVideo = true;
                                         }
-                                        // 旧帧直接丢弃（缩小后的缓冲被下一帧覆盖前不呈现）
                                     } else {
                                         pendingPtsMs = s.contentPosMs;
                                         hasPendingVideo = true;
@@ -669,11 +760,11 @@ static void* decodeThread(void* arg) {
                         g_libs.av_frame_unref_(d.frame);
                         continue;
                     }
-                    break;  // EAGAIN / EOF
+                    break;
                 }
             }
 
-            // 收音频帧并播放（ALSA 阻塞写 = 主时钟）
+            // 收音频帧 → swr → 推入环形缓冲（不阻塞 ALSA 写入）
             if (d.actx) {
                 while (true) {
                     int ret = g_libs.avcodec_receive_frame_(d.actx, d.frame);
@@ -681,16 +772,15 @@ static void* decodeThread(void* arg) {
                         const int inFrames = d.frame->nb_samples;
                         if (inFrames > 0 && outSamples && !s.seekPending) {
                             if (ensureSwr(d, d.frame, s.ratePermillage)) {
-                                if (d.frame->sample_rate > 0 && !ao.ok) {
-                                    audioClose(ao);
-                                    audioOpen(ao, d.frame->sample_rate, (double)s.ratePermillage / 1000.0);
+                                // 首次有音频帧时启动 AudioPlayer（固定 48000Hz）
+                                if (!audio.ok && g_libs.snd_pcm_open_) {
+                                    audio.start();
                                 }
                                 const uint8_t* in[8] = { NULL };
                                 in[0] = d.frame->extended_data[0];
                                 if ((d.frame->format == AV_SAMPLE_FMT_U8P || d.frame->format == AV_SAMPLE_FMT_S16P ||
                                      d.frame->format == AV_SAMPLE_FMT_S32P || d.frame->format == AV_SAMPLE_FMT_FLTP ||
                                      d.frame->format == AV_SAMPLE_FMT_DBLP) && d.frame->channels > 1) {
-                                    // planar 多声道：swr 可从 extended_data 连续平面读取
                                     in[1] = d.frame->extended_data[1];
                                     in[2] = d.frame->extended_data[2];
                                     in[3] = d.frame->extended_data[3];
@@ -702,37 +792,11 @@ static void* decodeThread(void* arg) {
                                 int outFrames = g_libs.swr_convert_(d.swr, (uint8_t**)&outSamples,
                                                                     (int)(outSamplesBytes / 4),
                                                                     in, inFrames);
-                                // swr 建立后：按实际源率与当前倍速校准 ALSA（倍速变化时也重开）
-                                if (d.swr && d.frame->sample_rate > 0 && (!ao.ok || ao.outRate != (unsigned int)d.swrOutRate)) {
-                                    audioClose(ao);
-                                    audioOpen(ao, d.frame->sample_rate, (double)s.ratePermillage / 1000.0);
-                                }
-                                if (outFrames > 0 && ao.ok && g_libs.snd_pcm_writei_) {
+                                if (outFrames > 0 && audio.ok) {
                                     applyVolume(outSamples, outFrames, s.volume);
-                                    int16_t* p = outSamples;
-                                    int remain = outFrames;
-                                    int failStreak = 0;
-                                    while (remain > 0 && !s.stopFlag && !s.seekPending && !s.paused) {
-                                        long wrote = g_libs.snd_pcm_writei_(ao.pcm, p, (unsigned long)remain);
-                                        if (wrote > 0) {
-                                            p += wrote * 2;
-                                            remain -= (int)wrote;
-                                            failStreak = 0;
-                                        } else if (wrote == -11 /*EAGAIN*/) {
-                                            usleep(4000);
-                                        } else if (++failStreak <= 10) {
-                                            /* xrun: drop stale buffer then prepare to restart clean */
-                                            if (g_libs.snd_pcm_drop_) g_libs.snd_pcm_drop_(ao.pcm);
-                                            if (g_libs.snd_pcm_prepare_ && g_libs.snd_pcm_prepare_(ao.pcm) == 0) continue;
-                                            ao.ok = false; break;
-                                        } else {
-                                            ao.ok = false;  // 放弃音频，转墙钟
-                                            break;
-                                        }
-                                    }
+                                    audio.push(outSamples, outFrames);
                                 }
                                 playedSrcSamples += inFrames;
-                                // 进度：basePos + 已解码源采样 / 源率（内容时间），墙钟同步
                                 if (d.frame->sample_rate > 0) {
                                     s.contentPosMs = s.basePosMs + (double)playedSrcSamples / (double)d.frame->sample_rate * 1000.0;
                                     s.wallBaseMs = s.nowMs();
@@ -768,7 +832,6 @@ static void* decodeThread(void* arg) {
                 }
             } else if (!fedPacket) {
                 if (frameReady && s.fb.valid && s.targetW > 0 && s.nowMs() - lastBlitMs > 250) {
-                    // UI 重绘可能把视频区刷黑，周期性重绘上一帧兜底
                     s.fb.blitLandscape(scaleBuf, s.targetW, s.blitX, s.blitY, s.targetW, s.targetH);
                     lastBlitMs = s.nowMs();
                 }
@@ -783,8 +846,7 @@ static void* decodeThread(void* arg) {
     }
 
 done:
-    (void)opened;
-    audioClose(ao);
+    audio.stop();
     decodeCtxClose(d);
     if (scaleBuf) free(scaleBuf);
     if (outSamples) free(outSamples);
@@ -803,9 +865,9 @@ static void sessionStopAndFree(Session* s) {
         pthread_join(s->thread, NULL);
         s->threadStarted = false;
     }
-    /* Clear ENTIRE framebuffer to black so no video pixels linger after exit */
-    if (s->fb.valid && s->fb.mem && s->fb.memSize > 0) {
-        memset(s->fb.mem, 0, s->fb.memSize);
+    // 清全屏 fb0（所有缓冲）并等待 vsync
+    if (s->fb.valid) {
+        s->fb.clearAll();
     }
     s->fb.close();
     delete s;
@@ -831,7 +893,7 @@ JSValue retErr(JSContext* ctx, const char* msg) {
 bool getPathArg(JSContext* ctx, int argc, JSValueConst* argv, std::string& path) {
     if (argc < 1 || !JS_IsObject(argv[0])) return false;
     JSValue v = JS_GetPropertyStr(ctx, argv[0], "path");
-    if (JS_IsException(v)) return false;
+    JS_IsException(v);
     const char* c = JS_ToCString(ctx, v);
     JS_FreeValue(ctx, v);
     if (!c) return false;
@@ -897,7 +959,6 @@ JSValue videoPlay(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     g_session = s;
     pthread_mutex_unlock(&g_sessionMutex);
 
-    // 等媒体打开（最多 4 秒），把探测结果带回 JS
     for (int i = 0; i < 400; i++) {
         if (g_session != s) break;
         if (!s->lastError.empty() || s->videoW > 0 || s->durationMs > 0 || !s->active) break;
@@ -908,7 +969,7 @@ JSValue videoPlay(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
         const std::string err = !s->lastError.empty() ? s->lastError : std::string("open-timeout");
         JS_SetPropertyStr(ctx, r, "ok", JS_NewBool(ctx, false));
         JS_SetPropertyStr(ctx, r, "error", JS_NewString(ctx, err.c_str()));
-        return r;  // 失败会话由下次 play/stop 清理
+        return r;
     }
     JS_SetPropertyStr(ctx, r, "ok", JS_NewBool(ctx, true));
     JS_SetPropertyStr(ctx, r, "videoW", JS_NewInt32(ctx, s->videoW));
@@ -971,7 +1032,6 @@ JSValue videoSetRate(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     if (rate < 0.25) rate = 0.25;
     if (rate > 4.0) rate = 4.0;
     s->ratePermillage = (int)(rate * 1000.0 + 0.5);
-    // swr 会在下一帧按新率重建（ensureSwr 检测 ratePermillage 变化）
     return retOk(ctx);
 }
 
