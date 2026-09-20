@@ -304,6 +304,15 @@ static bool audioOpen(AudioOut& ao, int srcRate, double rateF) {
     err = g_libs.snd_pcm_set_params_(ao.pcm, 2 /*S16_LE*/, 3 /*RW_INTERLEAVED*/,
                                      2, ao.outRate, 1, 500000);
     if (err < 0) { audioClose(ao); return false; }
+    // 预填 150ms 静音，让缓冲一开始就有深度，避免 blit 阻塞导致 underrun 爆音
+    if (g_libs.snd_pcm_writei_) {
+        int prefill = (int)(ao.outRate * 0.15);
+        int16_t* silence = (int16_t*)calloc((size_t)prefill * 2, sizeof(int16_t));
+        if (silence) {
+            g_libs.snd_pcm_writei_(ao.pcm, silence, (unsigned long)prefill);
+            free(silence);
+        }
+    }
     ao.ok = true;
     return true;
 }
@@ -534,7 +543,8 @@ static void* decodeThread(void* arg) {
     if (d.aStream >= 0) {
         outSamplesBytes = (size_t)(192000 * 2 * 2);  // 1s@48k 立体声 s16 上限
         outSamples = (int16_t*)malloc(outSamplesBytes);
-        audioOpen(ao, 48000, 1.0);  // 实际率在 swr 建立后按帧率重开
+        // 不在此处预打开 ALSA：等第一帧音频拿到真实采样率再开，
+        // 避免 close+reopen 产生的启动咔哒声。
     }
 
     s.clockByAudio = false;
@@ -793,10 +803,9 @@ static void sessionStopAndFree(Session* s) {
         pthread_join(s->thread, NULL);
         s->threadStarted = false;
     }
-    /* Clear video frame from fb0 so it does not linger after app exit */
-    if (s->fb.valid && s->targetW > 0 && s->targetH > 0) {
-        uint8_t* black = (uint8_t*)calloc((size_t)s->targetW * (size_t)s->targetH * 4, 1);
-        if (black) { s->fb.blitLandscape(black, s->targetW, s->blitX, s->blitY, s->targetW, s->targetH); free(black); }
+    /* Clear ENTIRE framebuffer to black so no video pixels linger after exit */
+    if (s->fb.valid && s->fb.mem && s->fb.memSize > 0) {
+        memset(s->fb.mem, 0, s->fb.memSize);
     }
     s->fb.close();
     delete s;

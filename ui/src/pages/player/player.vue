@@ -224,7 +224,6 @@ export default {
         if (it.rate) this.rate = it.rate
       }
     } catch (e) { /* 历史缺失不阻塞播放 */ }
-    this.volume = 0  // ---- TEMP TEST HOOK: 静音验证（增益 0，不发声；验证后移除）----
     try {
       if (this.path) await this.start(this.path, resumeMs)
     } catch (e) {
