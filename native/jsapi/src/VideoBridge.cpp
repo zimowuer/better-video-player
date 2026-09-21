@@ -1,8 +1,7 @@
-// 更好的视频播放器 · 原生 video 模块 (v3: 独立音频线程 + 固定采样率)
+// 更好的视频播放器 · 原生 video 模块 (v4: 修复变调/爆音/残留/ALSA释放)
 // FFmpeg(4.4, libavcodec 58) 解码 + libswscale 缩放 + /dev/fb0 直写（竖屏 270° 旋转）+ ALSA 出声。
-// v3 修复：独立音频播放线程+环形缓冲（消除视频 blit 阻塞导致的 underrun）；
-//         固定 48000Hz ALSA 输出（倍速只改 swr 输入率，不 close/reopen ALSA）；
-//         stop 时清全屏 fb0 并等待 vsync（消除退出后画面残留）。
+// v4 修复：倍速不改 swr 输入率（消除变调）；环形缓冲 5 秒（抗 blit 阻塞）；
+//         clearAll 多轮清双缓冲+vsync（消除残留）；ALSA close 后短暂等待确保释放。
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "VideoBridge.hpp"
@@ -238,18 +237,25 @@ struct FbWriter {
         valid = false;
     }
 
-    // 清全屏（所有缓冲）并等待 vsync，确保黑屏真正显示
+    // 清全屏（所有双缓冲）并等待 vsync，确保黑屏真正显示
     void clearAll() {
         if (!valid || !mem || memSize == 0) return;
-        memset(mem, 0, memSize);
-        // 设置显示偏移到第一缓冲
+        int dummy = 0;
         fb_var_screeninfo vinfo;
+        // 多轮清屏：清当前页 → vsync → 切到另一页 → 清 → vsync → 切回 → 清 → vsync
+        for (int pass = 0; pass < 3; pass++) {
+            memset(mem, 0, memSize);
+            if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+                vinfo.yoffset = (pass % 2) * physH;
+                ioctl(fd, FBIOPUT_VSCREENINFO, &vinfo);
+            }
+            ioctl(fd, FBIO_WAITFORVSYNC, &dummy);
+        }
+        // 最终切回第 0 页
         if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
             vinfo.yoffset = 0;
             ioctl(fd, FBIOPUT_VSCREENINFO, &vinfo);
         }
-        // 等待一帧 vsync 让硬件刷出黑屏
-        int dummy = 0;
         ioctl(fd, FBIO_WAITFORVSYNC, &dummy);
     }
 
@@ -278,7 +284,7 @@ struct FbWriter {
 // ---------------------------------------------------------------------------
 
 #define AUDIO_OUT_RATE 48000u
-#define AUDIO_RING_SECONDS 2
+#define AUDIO_RING_SECONDS 5
 #define AUDIO_RING_FRAMES (AUDIO_OUT_RATE * AUDIO_RING_SECONDS)
 
 static Libs g_libs;
@@ -371,6 +377,8 @@ struct AudioPlayer {
         }
         pcm = NULL;
         ok = false;
+        // 短暂等待内核释放 ALSA 设备，确保其他应用可以出声
+        usleep(200000);
     }
 
     void clearBuffer() {
@@ -390,7 +398,7 @@ struct AudioPlayer {
 private:
     static void* playbackThread(void* arg) {
         AudioPlayer* self = (AudioPlayer*)arg;
-        int16_t tmp[1024 * 2];
+        int16_t tmp[2048 * 2];
         while (!self->quit) {
             pthread_mutex_lock(&self->mtx);
             while (self->ringCount == 0 && !self->quit && !self->paused) {
@@ -398,7 +406,7 @@ private:
             }
             if (self->quit) { pthread_mutex_unlock(&self->mtx); break; }
             if (self->paused) { pthread_mutex_unlock(&self->mtx); usleep(10000); continue; }
-            int chunk = self->ringCount < 1024 ? self->ringCount : 1024;
+            int chunk = self->ringCount < 2048 ? self->ringCount : 2048;
             for (int i = 0; i < chunk; i++) {
                 int idx = (self->ringR + i) % self->ringCap;
                 tmp[i * 2]     = self->ring[idx * 2];
@@ -519,10 +527,11 @@ static void decodeCtxClose(DecodeCtx& d) {
     if (d.fmt) g_libs.avformat_close_input_(&d.fmt);
 }
 
-// swr 重建：固定输出 48000Hz，输入率 = 源率 * 倍速（实现变速不变 ALSA）
-static bool ensureSwr(DecodeCtx& d, AVFrame* frame, int ratePermillage) {
-    const int inRateForSpeed = (int)((double)frame->sample_rate * ((double)ratePermillage / 1000.0) + 0.5);
-    if (d.swr && d.swrInFormat == frame->format && d.swrInRate == inRateForSpeed &&
+// swr 重建：固定输出 48000Hz，输入率始终为原始采样率（倍速不改音调）
+// 倍速只影响视频时钟，音频按原速播放以避免变调。
+static bool ensureSwr(DecodeCtx& d, AVFrame* frame, int /*ratePermillage*/) {
+    const int inRate = frame->sample_rate;
+    if (d.swr && d.swrInFormat == frame->format && d.swrInRate == inRate &&
         d.swrInLayout == (frame->channel_layout ? frame->channel_layout : 3)) {
         return true;
     }
@@ -532,15 +541,15 @@ static bool ensureSwr(DecodeCtx& d, AVFrame* frame, int ratePermillage) {
     }
     uint64_t inLayout = frame->channel_layout;
     if (inLayout == 0) inLayout = frame->channels == 1 ? 1 : 3;
-    // 输出固定 48000Hz；输入率 = 源率 * 倍速（倍速时输入率变高，swr 压缩时间 = 变速）
+    // 输出固定 48000Hz；输入率 = 原始采样率（倍速不变调）
     d.swr = g_libs.swr_alloc_set_opts_(NULL,
                                        3, (AVSampleFormat)AV_SAMPLE_FMT_S16, (int)AUDIO_OUT_RATE,
-                                       (int64_t)inLayout, (AVSampleFormat)frame->format, inRateForSpeed,
+                                       (int64_t)inLayout, (AVSampleFormat)frame->format, inRate,
                                        0, NULL);
     if (!d.swr) return false;
     if (g_libs.swr_init_(d.swr) < 0) { g_libs.swr_free_(&d.swr); d.swr = NULL; return false; }
     d.swrInFormat = frame->format;
-    d.swrInRate = inRateForSpeed;
+    d.swrInRate = inRate;
     d.swrInLayout = inLayout;
     return true;
 }
